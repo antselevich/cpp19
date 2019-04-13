@@ -1,4 +1,6 @@
 #!/usr/bin/python3
+import json
+
 import argparse
 import contextlib
 import enum
@@ -13,7 +15,7 @@ import zipfile
 from distutils.dir_util import copy_tree
 from urllib.request import urlopen
 
-log = logging.getLogger(__name__)
+log = logging.getLogger()
 
 
 class Platform(enum.Enum):
@@ -56,16 +58,16 @@ def temporary_file(**tempfile_args):
 
 def _subprocess_call(command, env=None):
     log.debug('Command:\n{}\nEnvironment:\n{}'.format(command, env))
-    try:
-        out = subprocess.check_output(command, stderr=subprocess.STDOUT, env=env, universal_newlines=True)
-        log.debug('Output:\n{}'.format(out))
-        return out
-    except subprocess.CalledProcessError as e:
-        raise RuntimeError('FAILED.\nCommand:{}\nExitcode: {}. Output:\n{}'.format(
-            command,
-            e.returncode,
-            e.output),
-        )
+    out = subprocess.run(
+        command,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=True,
+        universal_newlines=True,
+    )
+    log.debug('Output:\n{}'.format(out.stdout))
+    return out.stdout
 
 
 def _download_file(url, target):
@@ -90,6 +92,7 @@ def _find_makefile_dir(start_directory):
         return start_directory
 
     if len(content) != 1:
+        log.error('Too many files. Should be only one directory or archive')
         return None
 
     next_dir = os.path.join(start_directory, content[0])
@@ -109,6 +112,25 @@ def _has_only_archive(directory):
         return True
 
     return False
+
+
+def format_gtest_output(file_path):
+    if not os.path.getsize(file_path):
+        return ''
+
+    with open(file_path, 'rt') as fd:
+        data = json.load(fd)
+
+    result = []
+    for testsuite in data['testsuites']:
+        for test in testsuite['testsuite']:
+            if 'failures' in test:
+                result.append('{}.{}'.format(test['classname'], test['name']))
+
+    if not result:
+        return 'Tests: {}; Failed: {} | SUCCESS'.format(data['tests'], data['failures'])
+
+    return 'Tests: {}; Failed: {} ({})'.format(data['tests'], data['failures'], ', '.join(result))
 
 
 class BaseChecker:
@@ -186,16 +208,6 @@ class BaseChecker:
 
         self._prepare_workdir()
 
-        if self._task_name:
-            script_directory = os.path.dirname(os.path.abspath(__file__))
-            if os.path.exists(os.path.join(script_directory, 'tests')):
-                tests_dir = os.path.join(script_directory, 'tests', self._task_name)
-                if os.path.exists(tests_dir):
-                    shutil.copy(os.path.join(tests_dir, 'private.cpp'), os.path.join(self._workdir, 'private.cpp'))
-                    shutil.copy(os.path.join(tests_dir, 'private_advanced.cpp'), os.path.join(self._workdir, 'private_advanced.cpp'))
-                    shutil.copy(os.path.join(tests_dir, 'public.cpp'), os.path.join(self._workdir, 'public.cpp'))
-                    shutil.copy(os.path.join(tests_dir, 'public_advanced.cpp'), os.path.join(self._workdir, 'public_advanced.cpp'))
-
     def _save_makefile_dir(self, directory):
         makefile_dir = _find_makefile_dir(directory)
         if makefile_dir is not None:
@@ -214,6 +226,14 @@ class BaseChecker:
                 self._save_makefile_dir(tmp_dir)
         else:
             self._save_makefile_dir(self._sources)
+
+        if self._task_name:
+            tests_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'tests', self._task_name)
+            if os.path.exists(tests_dir):
+                shutil.copy(os.path.join(tests_dir, 'private.cpp'), os.path.join(self._workdir, 'private.cpp'))
+                shutil.copy(os.path.join(tests_dir, 'private_advanced.cpp'), os.path.join(self._workdir, 'private_advanced.cpp'))
+                shutil.copy(os.path.join(tests_dir, 'public.cpp'), os.path.join(self._workdir, 'public.cpp'))
+                shutil.copy(os.path.join(tests_dir, 'public_advanced.cpp'), os.path.join(self._workdir, 'public_advanced.cpp'))
 
     def _make(self, target, flags=''):
         make_command = [
@@ -238,26 +258,27 @@ class BaseChecker:
         if self._platform == Platform.MACOS:
             env['DYLD_LIBRARY_PATH'] = os.path.join(self._clang_dir, 'lib', 'clang', '8.0.0', 'lib', 'darwin')
 
-        try:
-            out = _subprocess_call([os.path.join(self._workdir, target), '--gtest_color=no'], env=env)
-        except RuntimeError as e:
-            if only_warnings:
-                log.warning('{}: {}'.format(target, e))
-            else:
-                raise RuntimeError('{}: {}'.format(target, e))
-        else:
-            log.debug(out)
+        with temporary_file(mode='w+t') as tmp_file:
+            try:
+                _subprocess_call([
+                    os.path.join(self._workdir, target),
+                    '--gtest_color=no',
+                    '--gtest_output=json:{}'.format(tmp_file),
+                ], env=env)
+                log.info('{}: {}'.format(target, format_gtest_output(tmp_file)))
+            except subprocess.CalledProcessError as err:
+                log.debug(err)
 
-    def run_unittests(self):
-        log.debug('Run local unit tests')
+                e = format_gtest_output(tmp_file)
+                if err.stderr:
+                    e += '\n{}'.format(err.stderr)
 
-        for sanitizer in self._sanitizers:
-            log.debug('Run with {} sanitizer'.format(sanitizer))
-
-            self._make('clean')
-            self._make('all', '-fsanitize={}'.format(sanitizer))
-
-            self._run_target('check')
+                if only_warnings:
+                    log.warning('{}: {}'.format(target, e))
+                else:
+                    log.error('{}: {}'.format(target, e))
+                    return 1
+        return 0
 
     def run_with_coverage(self, cov_format='report'):
         if self._platform == Platform.WINDOWS:
@@ -285,16 +306,28 @@ class BaseChecker:
         log.info('Coverage results:\n{}'.format(out))
 
     def run_tests(self):
+        result = 0
+
         for sanitizer in self._sanitizers:
-            log.info('Run tests with {} sanitizer'.format(sanitizer))
+            log.info('Run with sanitizer {}'.format(sanitizer))
 
             self._make('clean')
             self._make('all', '-fsanitize={}'.format(sanitizer))
 
-            self._run_target('public')
-            self._run_target('public_advanced', True)
-            self._run_target('private')
-            self._run_target('private_advanced', True)
+            for target in (
+                    'check',
+                    'public',
+                    'private',
+                    'public_advanced',
+                    'private_advanced',
+            ):
+                log.debug('Starting target {} with sanitizer {}'.format(target, sanitizer))
+
+                only_warnings = '_advanced' in target
+                result += self._run_target(target, only_warnings)
+
+        if result:
+            raise RuntimeError('Tests failed')
 
     def remove_workdir(self):
         if os.path.exists(self._workdir):
@@ -310,7 +343,7 @@ def parse_args():
     parser.add_argument('-a', '--cash-dir', default=os.path.abspath(os.path.dirname(__file__)),
                         help='Directory for uploading CLang, Google Test and LLVM')
     parser.add_argument('task_name', nargs='?', help='Name of task at anytask.org')
-    parser.add_argument('sources', help='Directory with sources or archive')
+    parser.add_argument('sources', help='Directory with sources')
 
     args = parser.parse_args()
     return args
@@ -318,19 +351,28 @@ def parse_args():
 
 def main():
     args = parse_args()
-    logging.basicConfig(level=logging.DEBUG if args.debug else logging.INFO)
+    logging.basicConfig(
+        format='%(levelname)s %(asctime)s: %(message)s',
+        level=logging.DEBUG if args.debug else logging.INFO,
+    )
 
     checker = BaseChecker(args.sources, args.task_name, args.cash_dir)
-
     try:
         checker.set_up()
 
-        checker.run_unittests()
         checker.run_with_coverage(args.coverage_format)
         checker.run_tests()
 
         log.info('SUCCESS')
         exitcode = ExitCode.SUCCESS
+    except subprocess.CalledProcessError as e:
+        log.error('FAILED.\nCommand:{}\nExitcode: {}.\nStdout:\n{}\nStderr:\n{}'.format(
+            e.cmd,
+            e.returncode,
+            e.stdout,
+            e.stderr,
+        ))
+        exitcode = ExitCode.TESTS_ERRORS
     except RuntimeError as e:
         log.error(e)
         exitcode = ExitCode.TESTS_ERRORS
