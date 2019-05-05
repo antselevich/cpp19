@@ -9,11 +9,11 @@ GMOCK=$(SRCD)/googletest/googlemock
 ifeq ($(OS),Windows_NT)
 LDFLAGS=$(LINKER_FLAGS)
 RM_COMMAND=del /F /Q /S
-WARN_OPTS=-Wall -Werror -pedantic -Wno-language-extension-token
+WARN_OPTS=-Wall -Werror -pedantic -Wno-language-extension-token -Wno-deprecated-declarations
 else
 LDFLAGS=-lm -lpthread $(LINKER_FLAGS)
 RM_COMMAND=rm -f
-WARN_OPTS=-Wall -Werror -pedantic
+WARN_OPTS=-Wall -Werror -pedantic -Wno-deprecated-declarations
 endif
 
 
